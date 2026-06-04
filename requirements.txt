@@ -1,0 +1,13 @@
+torch
+transformers
+datasets
+tqdm
+matplotlib
+numpy
+nbconvert
+ipykernel
+sentencepiece
+safetensors
+tokenizers
+accelerate
+huggingface-hub
