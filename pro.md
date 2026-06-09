@@ -26,3 +26,9 @@ gpt2 lay_11_eigs 为什么突然剧变
 
 4. 注意把统计hidden states协方差的时候 要扣掉padding 符号对应的vector
 - masked
+
+
+
+6/5
+1. 标记有效秩的矩阵尺寸
+2. 数据加载
