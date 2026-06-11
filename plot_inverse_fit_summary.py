@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+"""
+Plot summary of layer-wise reciprocal fit parameters across models.
+Reads all results/*/layer_inverse_fit.csv files and plots slope/intercept vs layer for each model on the same figure.
+"""
 import argparse
 import csv
 from pathlib import Path

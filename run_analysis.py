@@ -39,7 +39,7 @@ def free_memory():
 # ================================
 @dataclass
 class Config:
-    model_names = ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B", "Qwen/Qwen3-8B", "Qwen/Qwen3-14B"]
+    model_names = ["Qwen/Qwen3-14B"]
     dataset_name = "Salesforce/wikitext"
     dataset_config = "wikitext-2-raw-v1"
     dataset_mirror: Optional[str] = "https://hf-mirror.com"
@@ -363,164 +363,6 @@ def analyze_effective_ranks_and_entropy(blocks, hidden_size: int, model_name: st
     fig.tight_layout()
     fig.savefig(model_dir / "effective_rank_entropy_vs_depth.png", bbox_inches='tight')
     plt.close(fig)
-
-def analyze_hidden_state_spectra(
-    model,
-    batches,
-    hidden_size: int,
-    num_layers: int,
-    device: torch.device,
-    cfg: Config,
-    model_name: str,
-    model_dir: Path,
-) -> None:
-    target_device = model.device
-
-    # Put accumulators on CPU to completely safeguard GPU VRAM for the 32B model
-    accs = [CovAccumulator(hidden_size, cfg.cov_dtype, device='cpu') for _ in range(num_layers)]
-    sum_unit_vecs = [torch.zeros(hidden_size, dtype=cfg.cov_dtype, device='cpu') for _ in range(num_layers)]
-    token_counts = [0] * num_layers
-
-    for batch in tqdm(batches, desc=f"Hidden states ({model_name})"):
-        batch_dev = {k: v.to(target_device) for k, v in batch.items()}
-        attn_mask = batch_dev.get("attention_mask")
-        
-        with torch.inference_mode():
-            outputs = model(**batch_dev, output_hidden_states=True, use_cache=False)
-            hidden_list = list(outputs.hidden_states)
-        
-        del outputs
-        del batch_dev
-
-        for i in range(1, len(hidden_list)):
-            h = hidden_list[i]                     
-            idx = i - 1
-
-            x = h.reshape(-1, h.shape[-1])
-            if attn_mask is not None:
-                token_mask = attn_mask.reshape(-1).bool().to(x.device)
-                x = x[token_mask]
-                if x.numel() == 0:
-                    hidden_list[i] = None
-                    continue
-
-            x = layernorm_no_params(x, cfg.eps)
-            x_cpu = x.cpu().float()
-
-            norm = torch.norm(x_cpu, dim=-1, keepdim=True).clamp(min=cfg.eps)
-            x_unit = x_cpu / norm
-            
-            sum_unit_vecs[idx] += x_unit.sum(dim=0)
-            token_counts[idx] += x_unit.shape[0]
-
-            accs[idx].update(x_cpu)
-            
-            # Drop the intermediate tensors explicitly
-            del x, x_cpu, norm, x_unit, h
-            hidden_list[i] = None
-
-        del hidden_list
-        free_memory()
-
-    avg_cos_sim = []
-    for i in range(num_layers):
-        n = token_counts[i]
-        if n < 2:
-            avg_cos_sim.append(float('nan'))
-        else:
-            sum_vec = sum_unit_vecs[i]
-            norm_sq = (sum_vec @ sum_vec).item()
-            avg = (norm_sq - n) / (n * (n - 1))
-            avg_cos_sim.append(avg)
-
-    with open(model_dir / "avg_cosine_similarity.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["layer", "avg_cosine_similarity"])
-        for i, val in enumerate(avg_cos_sim):
-            writer.writerow([i, val])
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(range(num_layers), avg_cos_sim, marker='o', linewidth=1.0)
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Average Cosine Similarity (all tokens)")
-    ax.set_title(f"{model_name} average token-pair cosine similarity vs depth")
-    ax.grid(True, linestyle='--', alpha=0.6)
-    fig.tight_layout()
-    fig.savefig(model_dir / "avg_cosine_similarity_vs_depth.png")
-    plt.close(fig)
-
-    logmeans = []
-    eigs_by_layer = {}
-    reciprocal_fit_rows = []
-    layer_step = 3 if num_layers <= 24 else 5
-    selected_layers = list(range(0, num_layers, layer_step))
-    if (num_layers - 1) not in selected_layers:
-        selected_layers.append(num_layers - 1)
-    
-    for i in tqdm(range(len(accs)), desc=f"Eig spectra ({model_name})"):
-        acc = accs[i]
-        if acc is None:
-            continue
-        try:
-            cov = acc.covariance()
-            eigs = eigvals_sorted(cov, cfg.eps)
-            plot_loglog_eigs(eigs, model_dir / f"layer_{i:02d}_eigs.png", f"{model_name} layer {i} eigs")
-            slope, intercept, r2 = fit_inverse_function(eigs)
-            reciprocal_fit_rows.append([i, slope, intercept, r2, int(eigs.shape[0])])
-            if i in selected_layers:
-                eigs_by_layer[i] = eigs.cpu() 
-            logmeans.append(float(torch.log(eigs).mean().item()))
-        except ValueError as e:
-            print(f"\n[Warning] Skipping layer {i} spectra calculation: {e}")
-            logmeans.append(float('nan'))
-            
-        # Explictly sever the references to the large tensors before garbage collection
-        accs[i] = None 
-        del acc, cov, eigs
-        free_memory() 
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    max_n = None
-    for i in selected_layers:
-        eigs = eigs_by_layer.get(i)
-        if eigs is None:
-            continue
-        n = eigs.shape[0]
-        max_n = n
-        xs = np.arange(1, n + 1)
-        ys = eigs.numpy()
-        ax.plot(_piecewise_log2_x(xs), ys, linewidth=1.0, label=f"Layer {i}")
-    ax.set_yscale("log")
-    if max_n is not None:
-        _set_piecewise_log2_xaxis(ax, max_n)
-    ax.set_xlabel("Principal component index")
-    ax.set_ylabel("Eigenvalue")
-    ax.set_title(f"{model_name} eigs by layer (every {layer_step})")
-    ax.legend(fontsize=8, ncol=2)
-    fig.tight_layout()
-    fig.savefig(model_dir / "layer_eigs_overview.png")
-    plt.close(fig)
-
-    with open(model_dir / "layer_log_eig_mean.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["layer", "log_eig_mean"])
-        for i, v in enumerate(logmeans):
-            writer.writerow([i, v])
-
-    with open(model_dir / "layer_inverse_fit.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["layer", "slope", "intercept", "r2", "num_points"])
-        for row in reciprocal_fit_rows:
-            writer.writerow(row)
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(list(range(len(logmeans))), logmeans, marker="o", linewidth=1.0)
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Mean log eigenvalue")
-    ax.set_title(f"{model_name} log-eig mean vs depth")
-    fig.tight_layout()
-    fig.savefig(model_dir / "log_eig_mean_vs_depth.png")
-    plt.close(fig)
     
 def mse_distance_matrix(x: torch.Tensor, y: torch.Tensor = None):
     """
@@ -587,52 +429,193 @@ def estimate_intrinsic_dimension_twonn(vectors: torch.Tensor, subsample: int = 2
     d = -coeffs[0]                 # 斜率应为 -d
     return float(d)
 
-def analyze_twonn(model, batches, num_layers, hidden_size, cfg, model_name, model_dir):
-    """
-    逐层收集 token 向量（原始 hidden state，无额外归一化），
-    用 Two-NN 估计内在维度，保存结果及绘图。
-    """
-    device = model.device
-    max_tokens_per_layer = min(cfg.embedding_sample_size, 10000)  # 可调
-    layer_samples = [[] for _ in range(num_layers)]
-    layer_counts = [0] * num_layers
+def analyze_hidden_states_and_twonn(
+    model,
+    batches,
+    hidden_size: int,
+    num_layers: int,
+    device: torch.device,
+    cfg: Config,
+    model_name: str,
+    model_dir: Path,
+) -> None:
+    target_device = model.device
 
-    with torch.inference_mode():
-        for batch_idx, batch in enumerate(tqdm(batches, desc=f"Two-NN collection ({model_name})")):
-            batch_dev = {k: v.to(device) for k, v in batch.items()}
+    # --- 1. 初始化频谱分析(Spectra)的累加器 ---
+    accs = [CovAccumulator(hidden_size, cfg.cov_dtype, device='cpu') for _ in range(num_layers)]
+    sum_unit_vecs = [torch.zeros(hidden_size, dtype=cfg.cov_dtype, device='cpu') for _ in range(num_layers)]
+    token_counts = [0] * num_layers
+
+    # --- 2. 初始化 Two-NN 的采样缓存 ---
+    max_tokens_per_layer = min(cfg.embedding_sample_size, 10000)
+    layer_samples = [[] for _ in range(num_layers)]
+    twonn_layer_counts = [0] * num_layers
+
+    # --- 3. 统一的数据收集循环（只跑一次前向传播） ---
+    for batch_idx, batch in enumerate(tqdm(batches, desc=f"Hidden states & Two-NN ({model_name})")):
+        batch_dev = {k: v.to(target_device) for k, v in batch.items()}
+        attn_mask = batch_dev.get("attention_mask")
+        
+        # 仅跑一次前向传播
+        with torch.inference_mode():
             outputs = model(**batch_dev, output_hidden_states=True, use_cache=False)
-            hidden_states = outputs.hidden_states   # tuple of (embed + num_layers) 实际长度 = num_layers+1
-            for layer_idx in range(num_layers):
-                h = hidden_states[layer_idx + 1]    # 第 layer_idx 层输出（已包含该层内部的归一化）
-                h_flat = h.reshape(-1, h.shape[-1])
-                if batch_dev.get("attention_mask") is not None:
-                    mask = batch_dev["attention_mask"].reshape(-1).bool()
-                    h_flat = h_flat[mask]
+            hidden_list = list(outputs.hidden_states)
+        
+        del outputs
+        del batch_dev
+
+        # 逐层提取和处理
+        for i in range(1, len(hidden_list)):
+            h = hidden_list[i]                     
+            idx = i - 1
+
+            h_flat = h.reshape(-1, h.shape[-1])
+            if attn_mask is not None:
+                token_mask = attn_mask.reshape(-1).bool().to(h_flat.device)
+                h_flat = h_flat[token_mask]
                 if h_flat.numel() == 0:
+                    hidden_list[i] = None
                     continue
-                need = max_tokens_per_layer - layer_counts[layer_idx]
-                if need <= 0:
-                    continue
+
+            # 【逻辑 A】Two-NN 数据收集 (使用原始未应用额外 LayerNorm 的状态)
+            need = max_tokens_per_layer - twonn_layer_counts[idx]
+            if need > 0:
                 if h_flat.shape[0] > need:
-                    idx = torch.randperm(h_flat.shape[0], device=device)[:need]
-                    h_sample = h_flat[idx].cpu().float()
+                    idx_perm = torch.randperm(h_flat.shape[0], device=target_device)[:need]
+                    h_sample = h_flat[idx_perm].cpu().float()
                 else:
                     h_sample = h_flat.cpu().float()
-                layer_samples[layer_idx].append(h_sample)
-                layer_counts[layer_idx] += h_sample.shape[0]
-            # 释放显存
-            del outputs, hidden_states, batch_dev
-            # 每 20 个 batch 强制回收一次
-            if (batch_idx + 1) % 20 == 0:
-                free_memory()
+                layer_samples[idx].append(h_sample)
+                twonn_layer_counts[idx] += h_sample.shape[0]
 
-    # 对每一层进行 Two-NN 估计
+            # 【逻辑 B】频谱分析数据收集 (需要应用无参数 LayerNorm)
+            x = layernorm_no_params(h_flat, cfg.eps)
+            x_cpu = x.cpu().float()
+
+            norm = torch.norm(x_cpu, dim=-1, keepdim=True).clamp(min=cfg.eps)
+            x_unit = x_cpu / norm
+            
+            sum_unit_vecs[idx] += x_unit.sum(dim=0)
+            token_counts[idx] += x_unit.shape[0]
+            accs[idx].update(x_cpu)
+            
+            # 释放当前层张量
+            del x, x_cpu, norm, x_unit, h
+            hidden_list[i] = None
+
+        del hidden_list
+        if (batch_idx + 1) % 20 == 0:
+            free_memory()
+
+    # --- 4. 后续处理：计算余弦相似度与频谱分析 ---
+    print(f"[{model_name}] Processing hidden state spectra plots and csv...")
+    avg_cos_sim = []
+    for i in range(num_layers):
+        n = token_counts[i]
+        if n < 2:
+            avg_cos_sim.append(float('nan'))
+        else:
+            sum_vec = sum_unit_vecs[i]
+            norm_sq = (sum_vec @ sum_vec).item()
+            avg = (norm_sq - n) / (n * (n - 1))
+            avg_cos_sim.append(avg)
+
+    with open(model_dir / "avg_cosine_similarity.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["layer", "avg_cosine_similarity"])
+        for i, val in enumerate(avg_cos_sim):
+            writer.writerow([i, val])
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(range(num_layers), avg_cos_sim, marker='o', linewidth=1.0)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Average Cosine Similarity (all tokens)")
+    ax.set_title(f"{model_name} average token-pair cosine similarity vs depth")
+    ax.grid(True, linestyle='--', alpha=0.6)
+    fig.tight_layout()
+    fig.savefig(model_dir / "avg_cosine_similarity_vs_depth.png")
+    plt.close(fig)
+
+    logmeans = []
+    eigs_by_layer = {}
+    reciprocal_fit_rows = []
+    layer_step = 3 if num_layers <= 24 else 5
+    selected_layers = list(range(0, num_layers, layer_step))
+    if (num_layers - 1) not in selected_layers:
+        selected_layers.append(num_layers - 1)
+    
+    for i in range(len(accs)):
+        acc = accs[i]
+        if acc is None:
+            continue
+        try:
+            cov = acc.covariance()
+            eigs = eigvals_sorted(cov, cfg.eps)
+            plot_loglog_eigs(eigs, model_dir / f"layer_{i:02d}_eigs.png", f"{model_name} layer {i} eigs")
+            slope, intercept, r2 = fit_inverse_function(eigs)
+            reciprocal_fit_rows.append([i, slope, intercept, r2, int(eigs.shape[0])])
+            if i in selected_layers:
+                eigs_by_layer[i] = eigs.cpu() 
+            logmeans.append(float(torch.log(eigs).mean().item()))
+        except ValueError as e:
+            print(f"\n[Warning] Skipping layer {i} spectra calculation: {e}")
+            logmeans.append(float('nan'))
+            
+        accs[i] = None 
+        del acc, cov, eigs
+        free_memory() 
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    max_n = None
+    for i in selected_layers:
+        eigs = eigs_by_layer.get(i)
+        if eigs is None:
+            continue
+        n = eigs.shape[0]
+        max_n = n
+        xs = np.arange(1, n + 1)
+        ys = eigs.numpy()
+        ax.plot(_piecewise_log2_x(xs), ys, linewidth=1.0, label=f"Layer {i}")
+    ax.set_yscale("log")
+    if max_n is not None:
+        _set_piecewise_log2_xaxis(ax, max_n)
+    ax.set_xlabel("Principal component index")
+    ax.set_ylabel("Eigenvalue")
+    ax.set_title(f"{model_name} eigs by layer (every {layer_step})")
+    ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(model_dir / "layer_eigs_overview.png")
+    plt.close(fig)
+
+    with open(model_dir / "layer_log_eig_mean.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["layer", "log_eig_mean"])
+        for i, v in enumerate(logmeans):
+            writer.writerow([i, v])
+
+    with open(model_dir / "layer_inverse_fit.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["layer", "slope", "intercept", "r2", "num_points"])
+        for row in reciprocal_fit_rows:
+            writer.writerow(row)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(list(range(len(logmeans))), logmeans, marker="o", linewidth=1.0)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Mean log eigenvalue")
+    ax.set_title(f"{model_name} log-eig mean vs depth")
+    fig.tight_layout()
+    fig.savefig(model_dir / "log_eig_mean_vs_depth.png")
+    plt.close(fig)
+
+    # --- 5. 后续处理：计算 Two-NN 内在维度 ---
+    print(f"[{model_name}] Processing Two-NN intrinsic dimension...")
     intrinsic_dims = []
     for l in range(num_layers):
-        if layer_counts[l] == 0:
+        if twonn_layer_counts[l] == 0:
             intrinsic_dims.append(float('nan'))
             continue
-        vectors = torch.cat(layer_samples[l], dim=0)   # (N, D)
+        vectors = torch.cat(layer_samples[l], dim=0)   
         if vectors.shape[0] < 50:
             print(f"[Warning] Layer {l} has only {vectors.shape[0]} tokens, skipping")
             intrinsic_dims.append(float('nan'))
@@ -642,18 +625,15 @@ def analyze_twonn(model, batches, num_layers, hidden_size, cfg, model_name, mode
             subsample=min(cfg.embedding_sample_size, vectors.shape[0])
         )
         intrinsic_dims.append(d_est)
-        # 清理
         layer_samples[l] = None
         free_memory()
 
-    # 保存 CSV
     with open(model_dir / "twonn_intrinsic_dim.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["layer", "intrinsic_dimension"])
         for i, d in enumerate(intrinsic_dims):
             writer.writerow([i, d])
 
-    # 绘图
     fig, ax = plt.subplots(figsize=(7, 4))
     layers = list(range(num_layers))
     if any(not np.isnan(d) for d in intrinsic_dims):
@@ -724,7 +704,7 @@ def analyze_model(model_name: str, texts, cfg: Config, device: torch.device) -> 
         print(f"\n[Warning] Effective ranks failed for {model_name}: {e}")
 
     try:
-        analyze_hidden_state_spectra(
+        analyze_hidden_states_and_twonn(
             model,
             batches,
             hidden_size,
@@ -735,12 +715,7 @@ def analyze_model(model_name: str, texts, cfg: Config, device: torch.device) -> 
             model_dir,
         )
     except Exception as e:
-        print(f"\n[Warning] Hidden state spectra failed for {model_name}: {e}")
-    # 放在 analyze_hidden_state_spectra 之后（或之前）
-    try:
-        analyze_twonn(model, batches, len(blocks), hidden_size, cfg, model_name, model_dir)
-    except Exception as e:
-        print(f"\n[Warning] Two-NN analysis failed for {model_name}: {e}")
+        print(f"\n[Warning] Combined Hidden States and Two-NN analysis failed for {model_name}: {e}")
 
     print(f"Releasing memory allocated for {model_name}...")
     del model
