@@ -147,17 +147,27 @@ def plot_loglog_eigs(eigvals: torch.Tensor, out_path: Path, title: str) -> None:
     ax.clear()
     plt.close(fig)
 
-def fit_inverse_function(eigvals: torch.Tensor) -> tuple[float, float, float]:
-    """Fits y = a / x + b to a layer's eigenvalue spectrum."""
+def fit_powerlaw_loglog(eigvals: torch.Tensor) -> tuple[float, float, float]:
+    """Fits a power-law y = c * x^k by linear regression on log-log axes.
+    Returns (slope_k, intercept_logc, r2).
+    """
     ys = eigvals.detach().cpu().numpy().astype(float)
     xs = np.arange(1, ys.shape[0] + 1, dtype=float)
-    design = np.column_stack([1.0 / xs, np.ones_like(xs)])
-    coeffs, _, _, _ = np.linalg.lstsq(design, ys, rcond=None)
+    # Filter positive values for log transform
+    mask = ys > 0
+    if mask.sum() < 3:
+        return float('nan'), float('nan'), float('nan')
+    xs = xs[mask]
+    ys = ys[mask]
+    lx = np.log(xs)
+    ly = np.log(ys)
+    A = np.column_stack([lx, np.ones_like(lx)])
+    coeffs, _, _, _ = np.linalg.lstsq(A, ly, rcond=None)
     slope = float(coeffs[0])
     intercept = float(coeffs[1])
-    fitted = design @ coeffs
-    ss_res = float(np.sum((ys - fitted) ** 2))
-    ss_tot = float(np.sum((ys - ys.mean()) ** 2))
+    fitted = A @ coeffs
+    ss_res = float(np.sum((ly - fitted) ** 2))
+    ss_tot = float(np.sum((ly - ly.mean()) ** 2))
     r2 = 1.0 if ss_tot == 0.0 else float(1.0 - ss_res / ss_tot)
     return slope, intercept, r2
 
@@ -538,7 +548,7 @@ def analyze_hidden_states_and_twonn(
 
     logmeans = []
     eigs_by_layer = {}
-    reciprocal_fit_rows = []
+    powerlaw_fit_rows = []
     layer_step = 3 if num_layers <= 24 else 5
     selected_layers = list(range(0, num_layers, layer_step))
     if (num_layers - 1) not in selected_layers:
@@ -552,8 +562,8 @@ def analyze_hidden_states_and_twonn(
             cov = acc.covariance()
             eigs = eigvals_sorted(cov, cfg.eps)
             plot_loglog_eigs(eigs, model_dir / f"layer_{i:02d}_eigs.png", f"{model_name} layer {i} eigs")
-            slope, intercept, r2 = fit_inverse_function(eigs)
-            reciprocal_fit_rows.append([i, slope, intercept, r2, int(eigs.shape[0])])
+            slope, intercept, r2 = fit_powerlaw_loglog(eigs)
+            powerlaw_fit_rows.append([i, slope, intercept, r2, int(eigs.shape[0])])
             if i in selected_layers:
                 eigs_by_layer[i] = eigs.cpu() 
             logmeans.append(float(torch.log(eigs).mean().item()))
@@ -593,10 +603,10 @@ def analyze_hidden_states_and_twonn(
         for i, v in enumerate(logmeans):
             writer.writerow([i, v])
 
-    with open(model_dir / "layer_inverse_fit.csv", "w", newline="") as f:
+    with open(model_dir / "layer_powerlaw_fit.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["layer", "slope", "intercept", "r2", "num_points"])
-        for row in reciprocal_fit_rows:
+        for row in powerlaw_fit_rows:
             writer.writerow(row)
 
     fig, ax = plt.subplots(figsize=(7, 4))
